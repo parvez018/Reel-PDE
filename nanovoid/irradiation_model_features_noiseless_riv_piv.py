@@ -1,0 +1,192 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import sys
+sys.path.append("../")
+
+
+from init_pfields import initialize_nucleus_v1
+from diff_ops import DifferentialOp, LaplacianOp
+from parameters import param
+from feature_extraction import get_features
+
+
+import math
+import os
+
+
+
+# from set_seed import seed_torch
+# seed_torch(546762)
+# torch.manual_seed(1234)
+# torch.cuda.manual_seed(1234)
+
+
+device = param.device
+
+def log_with_mask(mat, eps=param.eps):
+        mask = (mat < eps).detach()
+        mat = mat.masked_fill(mask=mask, value=eps)
+        return torch.log(mat)
+
+
+def fix_deviations(mat, lb=0.0, ub=1.0):
+        mat.masked_fill_(torch.ge(mat, ub).detach(), ub)
+        mat.masked_fill_(torch.le(mat, lb).detach(), lb)
+        return mat
+
+
+class IrradiationSingleTimestep(nn.Module):
+        def __init__(self, normalize=False):
+                super(IrradiationSingleTimestep, self).__init__()
+                self.energy_v0 = nn.Parameter(torch.randn(1)*5 + 0.1, requires_grad=True)       # E_v^f
+                self.energy_i0 = nn.Parameter(torch.randn(1)*5 + 0.1, requires_grad=True)       # E_i^f
+                self.kBT0 = nn.Parameter(torch.randn(1)*5 + 0.1, requires_grad=True)
+                
+                self.kappa_v0 = nn.Parameter(torch.randn(1) / 2.0 + 0.1, requires_grad=True)
+                self.kappa_i0 = nn.Parameter(torch.randn(1) / 2.0 + 0.1, requires_grad=True)
+                self.kappa_eta0 = nn.Parameter(torch.randn(1) / 2.0 + 0.1, requires_grad=True)
+                
+                self.r_bulk0 = nn.Parameter(torch.randn(1)*10 + 0.1, requires_grad=True)
+                self.r_surf0 = nn.Parameter(torch.randn(1)*5 + 0.1, requires_grad=True)
+
+                self.p_casc0 = nn.Parameter(torch.tensor(0.01-0.001), requires_grad=False)
+                self.bias0 = nn.Parameter(torch.tensor(0.3-0.001), requires_grad=True)
+                self.vg0 = nn.Parameter(torch.tensor(0.01-0.001), requires_grad=True)
+                
+                self.diff_v0 = nn.Parameter(torch.randn(1) / 2.0 + 0.1, requires_grad=True)    # D_v
+                self.diff_i0 = nn.Parameter(torch.randn(1) / 2.0 + 0.1, requires_grad=True)    # D_i
+                self.L0 = nn.Parameter(torch.randn(1) * 30.0 + 0.1, requires_grad=True)
+
+
+                self.fluct_norm = param.fluct_norm
+                self.dt = param.dt
+                self.dx = param.dx
+                self.dy = param.dy
+                self.lap = LaplacianOp()
+                self.normalize = normalize
+
+
+        def init_params(self, params):
+                self.energy_v0.data = torch.tensor([params[0]]) # 8
+                self.energy_i0.data = torch.tensor([params[1]]) # 8
+                self.kBT0.data = torch.tensor([params[2]])      # 5.0
+                self.kappa_v0.data = torch.tensor([params[3]])  # 1.0
+                self.kappa_i0.data = torch.tensor([params[4]])  # 1.0
+                self.kappa_eta0.data = torch.tensor([params[5]])  # 1.0
+                self.diff_v0.data = torch.tensor([params[11]])  # 1.0
+                self.diff_i0.data = torch.tensor([params[12]])  # 1.0
+                self.L0.data = torch.tensor([params[13]])         #1.0
+
+
+        def print_params(self, batch_loss=0.0):
+                print('%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.8f'
+                      % (self.energy_v0.item(),
+                         self.energy_i0.item(),
+                         self.kBT0.item(),
+                         self.kappa_v0.item(),
+                         self.kappa_i0.item(),
+                         self.kappa_eta0.item(),
+                         self.diff_v0.item(),
+                         self.diff_i0.item(),
+                         self.L0.item(),
+                         batch_loss))
+
+
+        def forward(self, features):
+                '''
+                input: features=tensor of size: batch x total_features x feature_size
+                output: 3 tensors cv_delta,ci_delta,eta_delta
+                        cv_delta = tensor of size: batch x feature_size
+                        same as above for ci_delta and eta_delta
+                '''
+                # print("features.size=",features.size())
+                # print("features[:,0].size=",features[:,11].size())
+                
+                # squeezed = False
+                # if features.dim()==2:
+                #         features = features.unsqueeze(0)
+                #         squeezed = True
+                
+                
+                energy_v = torch.abs(self.energy_v0) 
+                energy_i = torch.abs(self.energy_i0)
+                kBT = torch.abs(self.kBT0) 
+                
+                kappa_v = torch.abs(self.kappa_v0)
+                kappa_i = torch.abs(self.kappa_i0) 
+                kappa_eta = torch.abs(self.kappa_eta0) 
+                
+                r_bulk = torch.abs(self.r_bulk0)
+                r_surf = torch.abs(self.r_surf0)
+
+                p_casc = torch.abs(self.p_casc0)
+                bias = torch.abs(self.bias0) 
+                vg = torch.abs(self.vg0) 
+                
+                diff_v = torch.abs(self.diff_v0) 
+                diff_i = torch.abs(self.diff_i0)
+                
+                L = torch.abs(self.L0) 
+                
+                batch_size,total_features,*tmp = features.size()
+                all_cv_delta = None
+                all_ci_delta = None
+                all_eta_delta = None
+                all_deltas = None
+                                
+                
+                # ignoring last two features, as they are random and very small
+                cv_feature_coeffs = [(diff_v*energy_v/kBT),\
+                                        diff_v,\
+                                        -diff_v,\
+                                        diff_v/kBT,\
+                                        -(diff_v*kappa_v)/kBT,
+                                        -r_bulk,\
+                                        -r_surf,\
+                                        bias*vg]
+                # cv_feature_coeffs = [diff_v*energy_v/kBT,diff_v,-diff_v,diff_v/kBT,-diff_v*kappa_v/kBT]
+                cv_delta = torch.zeros_like(features[:,0])
+                for find in range(len(cv_feature_coeffs)):
+                        cv_delta += cv_feature_coeffs[find] * features[:,find]
+                
+                cv_delta *= self.dt
+              
+                
+                
+                ci_feature_coeffs = [(diff_i*energy_i)/kBT,\
+                                        diff_i,\
+                                        -diff_i,\
+                                        diff_i/kBT,\
+                                        -(kappa_i*diff_i)/kBT,
+                                        -r_bulk,\
+                                        -r_surf,\
+                                        (1-bias)*vg]
+                # ci_feature_coeffs = [diff_i*energy_i/kBT,diff_i,-diff_i,diff_i/kBT,-kappa_i*diff_i/kBT]
+                ci_feature_start_ind = 8
+                ci_delta = torch.zeros_like(features[:,0])
+                for find in range(len(ci_feature_coeffs)):
+                        ci_delta += ci_feature_coeffs[find] * features[:,find+ci_feature_start_ind]
+                
+                ci_delta *= self.dt
+                
+                
+                eta_feature_coeffs = [-L*energy_v*param.N,\
+                                        -L*energy_i*param.N,\
+                                        -L*kBT*param.N,\
+                                        -L*param.N,\
+                                        -L*(-kappa_eta)*param.N,\
+                                        (2*bias-1)*vg]
+                
+                
+                eta_feature_start_ind = 16
+                eta_delta = torch.zeros_like(features[:,0])
+                for find in range(len(eta_feature_coeffs)):
+                        eta_delta += eta_feature_coeffs[find]*features[:,find+eta_feature_start_ind]
+
+                eta_delta *= self.dt
+                
+                return cv_delta, ci_delta, eta_delta
+                
